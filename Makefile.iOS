@@ -1,0 +1,22 @@
+.PHONY: all clean install
+
+include ../../logging.mk
+include ../../build_env.mk
+
+all: fs_usage
+
+fs_usage:
+	@$(log_build)
+	SDKROOT=iphoneos cc -v -g -O0 -arch arm64e -F./private_tbd/ -framework ktrace -lutil -o fs_usage_ng fs_usage.c
+	codesign -s - fs_usage_ng
+
+clean:
+	rm fs_usage_ng
+	rm -f ${CRYPTEX_BIN_DIR}/fs_usage_ng
+
+
+.PHONY: install
+install: fs_usage
+	@$(log_install)
+	cp fs_usage_ng ${CRYPTEX_BIN_DIR}
+

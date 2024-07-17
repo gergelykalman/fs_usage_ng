@@ -34,18 +34,29 @@
 #include <aio.h>
 #include <string.h>
 #include <dirent.h>
-#include <libc.h>
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <sys/types.h>
+#include <sys/sysctl.h>
+
 #include <termios.h>
 #include <errno.h>
 #include <err.h>
-#include <libutil.h>
 #include <TargetConditionals.h>
 
-#include <ktrace/session.h>
-#include <System/sys/kdebug.h>
-#include <os/assumes.h>
+// NOTE: These are our private headers, since we don't have access to Apple's
+//       internal SDK. Most of these came from xnu, and other open-source tools
+//       IIRC
+// TODO: document where these headers originally came from
+#include "private_headers/System/sys/kdebug.h"
+#include "private_headers/System/sys/fcntl.h"
+#include "private_headers/our_ktrace.h"
+#include "private_headers/iphone_disk.h"
+#include "private_headers/dyld_cache_format.h"
 
-#include <sys/disk.h>
 #include <sys/fcntl.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
@@ -59,7 +70,7 @@
 #include <mach/clock_types.h>
 #include <mach/mach_time.h>
 
-#include <mach-o/dyld_cache_format.h>
+#define os_assert(_x) if (!(_x)) abort()
 
 /*
  * MAXCOLS controls when extra data kicks in.
@@ -129,7 +140,7 @@ void extend_syscall(uint64_t thread, int type, ktrace_event_t event);
 
 /* printing routines */
 bool check_filter_mode(pid_t pid, th_info_t ti, uint64_t type, int error, int retval, char *sc_name);
-void format_print(th_info_t ti, char *sc_name, ktrace_event_t event, uint64_t type, int format, uint64_t now, uint64_t stime, int waited, const char *pathname, struct diskio *dio);
+void format_print(th_info_t ti, char *sc_name, ktrace_event_t event, uint64_t type, int format, uint64_t now, uint64_t stime, int waited, const char *pathname, const char *pathname2, struct diskio *dio);
 int print_open(ktrace_event_t event, uint64_t flags);
 
 /* metadata info hash routines */
@@ -402,6 +413,7 @@ void cache_disk_names(void);
 #define BSC_openat		0x040c073c
 #define BSC_openat_nocancel	0x040c0740
 #define BSC_renameat		0x040c0744
+#define BSC_renameatx_np	0x040c07a0
 #define BSC_chmodat		0x040c074c
 #define BSC_chownat		0x040c0750
 #define BSC_fstatat		0x040c0754
@@ -470,6 +482,7 @@ void cache_disk_names(void);
 #define FMT_RENAMEAT	46
 #define FMT_IOCTL_SYNCCACHE 47
 #define FMT_GUARDED_OPEN 48
+#define FMT_RENAME	49
 
 #define DBG_FUNC_ALL	(DBG_FUNC_START | DBG_FUNC_END)
 
@@ -481,6 +494,7 @@ bool RAW_flag = false;
 bool wideflag = false;
 bool include_waited_flag = false;
 bool want_kernel_task = true;
+bool filter_non_root_pids = false;
 dispatch_source_t stop_timer, sigquit_source, sigpipe_source, sighup_source, sigterm_source, sigwinch_source;
 uint64_t mach_time_of_first_event;
 uint64_t start_time_ns = 0;
@@ -638,7 +652,7 @@ const struct bsd_syscall bsd_syscalls[MAX_BSD_SYSCALL] = {
 	SYSCALL(fsetattrlist, FMT_FD),
 	SYSCALL(getdirentriesattr, FMT_FD),
 	NORMAL_SYSCALL(exchangedata),
-	NORMAL_SYSCALL(rename),
+	SYSCALL(rename, FMT_RENAME),
 	NORMAL_SYSCALL(copyfile),
 	NORMAL_SYSCALL(checkuseraccess),
 	NORMAL_SYSCALL(searchfs),
@@ -657,6 +671,7 @@ const struct bsd_syscall bsd_syscalls[MAX_BSD_SYSCALL] = {
 	NORMAL_SYSCALL(getattrlistbulk),
 	SYSCALL_WITH_NOCANCEL(openat, FMT_OPENAT), /* open_nocancel() was previously shown as "open_nocanel" (note spelling) */
 	SYSCALL(renameat, FMT_RENAMEAT),
+	SYSCALL(renameatx_np, FMT_RENAMEAT),
 	SYSCALL(chmodat, FMT_CHMODAT),
 	SYSCALL(chownat, FMT_AT),
 	SYSCALL(fstatat, FMT_AT),
@@ -718,6 +733,7 @@ exit_usage(void)
 	fprintf(stderr, "  -R    specifies a raw trace file to process\n");
 	fprintf(stderr, "  -S    if -R is specified, selects a start point in microseconds\n");
 	fprintf(stderr, "  -E    if -R is specified, selects an end point in microseconds\n");
+	fprintf(stderr, "  -u    filter out non-root pids\n");
 	fprintf(stderr, "  pid   selects process(s) to sample\n");
 	fprintf(stderr, "  cmd   selects process(s) matching command string to sample\n");
 	fprintf(stderr, "By default (no options) the following processes are excluded from the output:\n");
@@ -735,6 +751,25 @@ static void fs_usage_cleanup(const char *message)
 	fprintf(stderr, "Cleaning up tracing state because of %s\n", message);
 }
 
+
+uint get_uid_for_pid(uint pid)
+{
+	int err;
+	int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+	struct kinfo_proc kp;
+	size_t len = sizeof(kp);
+
+	err = sysctl(mib, sizeof(mib)/sizeof(mib[0]), &kp, &len, NULL, 0);
+	if (err != 0)
+	{
+		perror("getting uid via sysctl() failed");
+		exit(1);
+	}
+
+	return kp.kp_eproc.e_ucred.cr_uid;
+}
+
+
 int
 main(int argc, char *argv[])
 {
@@ -743,20 +778,22 @@ main(int argc, char *argv[])
 	bool exclude_pids = false;
 	uint64_t time_limit_ns = 0;
 
-	os_set_crash_callback(&fs_usage_cleanup);
+	// TODO: re-enable this!
+	//os_set_crash_callback(&fs_usage_cleanup);
 
 	get_screenwidth();
 
 	s = ktrace_session_create();
 	os_assert(s != NULL);
-	(void)ktrace_ignore_process_filter_for_event(s, P_WrData);
+
+    (void)ktrace_ignore_process_filter_for_event(s, P_WrData);
 	(void)ktrace_ignore_process_filter_for_event(s, P_RdData);
 	(void)ktrace_ignore_process_filter_for_event(s, P_WrMeta);
 	(void)ktrace_ignore_process_filter_for_event(s, P_RdMeta);
 	(void)ktrace_ignore_process_filter_for_event(s, P_PgOut);
 	(void)ktrace_ignore_process_filter_for_event(s, P_PgIn);
 
-	while ((ch = getopt(argc, argv, "bewf:R:S:E:t:W")) != -1) {
+	while ((ch = getopt(argc, argv, "bewf:R:S:E:t:Wu")) != -1) {
 		switch (ch) {
 			case 'e':
 				exclude_pids = true;
@@ -817,6 +854,10 @@ main(int argc, char *argv[])
 				end_time_ns = NSEC_PER_SEC * atof(optarg);
 				break;
 
+			case 'u':
+				filter_non_root_pids = true;
+				break;
+
 			default:
 				exit_usage();
 		}
@@ -845,6 +886,7 @@ main(int argc, char *argv[])
 		 * filter the defaults out naturally.
 		 */
 		if (exclude_pids || argc == 0) {
+			ktrace_exclude_process(s, "fs_usage_ng");
 			ktrace_exclude_process(s, "fs_usage");
 			ktrace_exclude_process(s, "Terminal");
 			ktrace_exclude_process(s, "telnetd");
@@ -977,7 +1019,10 @@ main(int argc, char *argv[])
 void
 setup_ktrace_callbacks(void)
 {
-	ktrace_events_subclass(s, DBG_MACH, DBG_MACH_EXCP_SC, ^(ktrace_event_t event) {
+	// TODO: figure out how the numbers for ktrace_events_range are generated
+
+	//printf("DBG1 0x%0x 0x%0x\n", DBG_MACH, DBG_MACH_EXCP_SC);
+	ktrace_events_range(s, 0x10c0000, 0x10d0000, ^(ktrace_event_t event) {
 		int type;
 
 		type = event->debugid & KDBG_EVENTID_MASK;
@@ -991,7 +1036,8 @@ setup_ktrace_callbacks(void)
 		}
 	});
 
-	ktrace_events_subclass(s, DBG_MACH, DBG_MACH_VM, ^(ktrace_event_t event) {
+	// printf("DBG2 0x%0x 0x%0x\n", DBG_MACH, DBG_MACH_VM);
+	ktrace_events_range(s, 0x1300000, 0x1310000, ^(ktrace_event_t event) {
 		th_info_t ti;
 		unsigned int type;
 
@@ -1033,7 +1079,8 @@ setup_ktrace_callbacks(void)
 	});
 
 	if (include_waited_flag || RAW_flag) {
-		ktrace_events_subclass(s, DBG_MACH, DBG_MACH_SCHED, ^(ktrace_event_t event) {
+		//printf("DBG3 0x%0x 0x%0x\n", DBG_MACH, DBG_MACH_SCHED);
+		ktrace_events_range(s, 0x1400000, 0x1410000, ^(ktrace_event_t event) {
 			int type;
 
 			type = event->debugid & KDBG_EVENTID_MASK;
@@ -1047,7 +1094,8 @@ setup_ktrace_callbacks(void)
 		});
 	}
 
-	ktrace_events_subclass(s, DBG_FSYSTEM, DBG_FSRW, ^(ktrace_event_t event) {
+	//printf("DBG4 0x%0x 0x%0x\n", DBG_FSYSTEM, DBG_FSRW);
+	ktrace_events_range(s, 0x3010000, 0x3020000, ^(ktrace_event_t event) {
 		th_info_t ti;
 		int type;
 
@@ -1055,16 +1103,16 @@ setup_ktrace_callbacks(void)
 
 		switch (type) {
 			case HFS_modify_block_end:
-				/*
-				 * the expected path here is as follows:
-				 * enter syscall
-				 * look up a path, which gets stored in ti->vnode / ti->pathname
-				 * modify a metadata block -- we assume the modification has something to do with the path that was looked up
-				 * leave syscall
-				 * ...
-				 * later, someone writes that metadata block; the last path associated with it is attributed
-				 */
-				if ((ti = event_find(event->threadid, 0))) {
+				//
+				// the expected path here is as follows:
+				// enter syscall
+				// look up a path, which gets stored in ti->vnode / ti->pathname
+				// modify a metadata block -- we assume the modification has something to do with the path that was looked up
+				// leave syscall
+				// ...
+				// later, someone writes that metadata block; the last path associated with it is attributed
+
+                if ((ti = event_find(event->threadid, 0))) {
 					if (ti->newest_pathname)
 						meta_add_name(event->arg2, ti->newest_pathname);
 				}
@@ -1073,13 +1121,17 @@ setup_ktrace_callbacks(void)
 
 			case VFS_LOOKUP:
 				if (event->debugid & DBG_FUNC_START) {
+				
+//					const char *tmp;
+//					tmp = ktrace_get_path_for_vp(s, event->arg1);
+//					printf("VFS_LOOKUP %s\n", tmp);
+
 					if ((ti = event_find(event->threadid, 0)) && !ti->vnodeid) {
 						ti->vnodeid = event->arg1;
 					}
 				}
 
-				/* it can be both start and end */
-
+				// it can be both start and end
 				if (event->debugid & DBG_FUNC_END) {
 					if ((ti = event_find(event->threadid, 0)) && ti->vnodeid) {
 						const char *pathname;
@@ -1124,7 +1176,9 @@ setup_ktrace_callbacks(void)
 		}
 	});
 
-	ktrace_events_subclass(s, DBG_FSYSTEM, DBG_DKRW, ^(ktrace_event_t event) {
+
+	//printf("DBG5 0x%0x 0x%0x\n", DBG_FSYSTEM, DBG_DKRW);
+	ktrace_events_range(s, 0x3020000, 0x3030000, ^(ktrace_event_t event) {
 		struct diskio *dio;
 		unsigned int type;
 
@@ -1141,7 +1195,8 @@ setup_ktrace_callbacks(void)
 		}
 	});
 
-	ktrace_events_subclass(s, DBG_FSYSTEM, DBG_IOCTL, ^(ktrace_event_t event) {
+	//printf("DBG6 0x%0x 0x%0x\n", DBG_FSYSTEM, DBG_IOCTL);
+	ktrace_events_range(s, 0x3060000, 0x3070000, ^(ktrace_event_t event) {
 		th_info_t ti;
 		int type;
 		pid_t pid;
@@ -1153,7 +1208,7 @@ setup_ktrace_callbacks(void)
 				pid = ktrace_get_pid_for_thread(s, event->threadid);
 
 				if (check_filter_mode(pid, NULL, SPEC_unmap_info, 0, 0, "SPEC_unmap_info"))
-					format_print(NULL, "  TrimExtent", event, type, FMT_UNMAP_INFO, event->timestamp, event->timestamp, 0, "", NULL);
+					format_print(NULL, "  TrimExtent", event, type, FMT_UNMAP_INFO, event->timestamp, event->timestamp, 0, "", "", NULL);
 
 				break;
 
@@ -1176,7 +1231,8 @@ setup_ktrace_callbacks(void)
 	});
 
 	if (BC_flag || RAW_flag) {
-		ktrace_events_subclass(s, DBG_FSYSTEM, DBG_BOOTCACHE, ^(ktrace_event_t event) {
+		//printf("DBG7 0x%0x 0x%0x\n", DBG_FSYSTEM, DBG_BOOTCACHE);
+		ktrace_events_range(s, 0x3070000, 0x3080000, ^(ktrace_event_t event) {
 			struct diskio *dio;
 			unsigned int type;
 
@@ -1201,7 +1257,7 @@ setup_ktrace_callbacks(void)
 		type = event->debugid & KDBG_EVENTID_MASK;
 
 		switch (type) {
-			case BSC_exit: /* see below */
+			case BSC_exit: // see below
 				return;
 
 			case proc_exit:
@@ -1233,14 +1289,18 @@ setup_ktrace_callbacks(void)
 		}
 	};
 
-	ktrace_events_subclass(s, DBG_BSD, DBG_BSD_EXCP_SC, bsd_sc_proc_cb);
-	ktrace_events_subclass(s, DBG_BSD, DBG_BSD_PROC, bsd_sc_proc_cb);
+	//printf("DBG8 0x%0x 0x%0x\n", DBG_BSD, DBG_BSD_EXCP_SC);
+	ktrace_events_range(s, 0x40c0000, 0x40d0000, bsd_sc_proc_cb);
+
+	//printf("DBG9 0x%0x 0x%0x\n", DBG_BSD, DBG_BSD_PROC);
+	ktrace_events_range(s, 0x4010000, 0x4020000, bsd_sc_proc_cb);
 
 	ktrace_events_range(s, KDBG_EVENTID(DBG_BSD, DBG_BSD_SC_EXTENDED_INFO, 0), KDBG_EVENTID(DBG_BSD, DBG_BSD_SC_EXTENDED_INFO2 + 1, 0), ^(ktrace_event_t event) {
 		extend_syscall(event->threadid, event->debugid & KDBG_EVENTID_MASK, event);
 	});
 
-	ktrace_events_subclass(s, DBG_CORESTORAGE, DBG_CS_IO, ^(ktrace_event_t event) {
+	//printf("DBG10 0x%0x 0x%0x\n", DBG_CORESTORAGE, DBG_CS_IO);
+	ktrace_events_range(s, 0x40e0000, 0x4100000, ^(ktrace_event_t event) {
 		// the usual DBG_FUNC_START/END does not work for i/o since it will
 		// return on a different thread, this code uses the P_CS_IO_Done (0x4) bit
 		// instead. the trace command doesn't know how handle either method
@@ -1282,7 +1342,8 @@ setup_ktrace_callbacks(void)
 		}
 	});
 
-	ktrace_events_subclass(s, DBG_CORESTORAGE, 1 /* DBG_CS_SYNC */, ^(ktrace_event_t event) {
+	//printf("DBG11 0x%0x 0x%0x\n", DBG_CORESTORAGE, 1);
+	ktrace_events_range(s, 0xa000000, 0xa010000 /* DBG_CS_SYNC */, ^(ktrace_event_t event) {
 		int cs_type = event->debugid & P_CS_Type_Mask; // strip out the done bit
 		bool start = (event->debugid & P_CS_IO_Done) != P_CS_IO_Done;
 
@@ -1617,9 +1678,12 @@ print_open(ktrace_event_t event, uint64_t flags)
 		(flags & O_NONBLOCK) ? 'N' : '_',
 		(flags & O_SHLOCK) ? 'l' : (flags & O_EXLOCK) ? 'L' : '_',
 		(flags & O_NOFOLLOW) ? 'F' : '_',
+		(flags & O_NOFOLLOW_ANY) ? 'f' : '_',
 		(flags & O_SYMLINK) ? 'S' : '_',
 		(flags & O_EVTONLY) ? 'V' : '_',
 		(flags & O_CLOEXEC) ? 'X' : '_',
+		(flags & O_EXEC)    ? 'e' : '_',
+		(flags & O_SEARCH)   ? 's' : '_',
 		'\0',
 	};
 
@@ -1649,7 +1713,7 @@ print_open(ktrace_event_t event, uint64_t flags)
 void
 format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 	     uint64_t type, int format, uint64_t now, uint64_t stime,
-	     int waited, const char *pathname, struct diskio *dio)
+	     int waited, const char *pathname, const char *pathname2, struct diskio *dio)
 {
 	uint64_t secs, usecs;
 	int nopadding = 0;
@@ -1724,6 +1788,9 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 	if (!want_kernel_task && pid == 0)
 		return;
 
+	if (filter_non_root_pids && get_uid_for_pid(pid) != 0)
+		return;
+
 	if (!command_name)
 		command_name = "";
 
@@ -1748,6 +1815,7 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 	}
 
 	clen = printf("%s  %-17.17s", timestamp, sc_name);
+	//clen += printf("uid: %d", uid);
 
 	framework_name = NULL;
 
@@ -1771,6 +1839,10 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 				else
 					clen += printf("                  ");
 
+				break;
+
+			case FMT_RENAME:
+				clen += printf("      [%3d]       ", (int)event->arg1);
 				break;
 
 			case FMT_FD:
@@ -2862,7 +2934,10 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 				len = sprintf(&buf[0], " [%d]/%s ", (int)ti->arg1, pathname);
 				break;
 			case FMT_RENAMEAT:
-				len = sprintf(&buf[0], " [%d]/%s ", (int)ti->arg3, pathname);
+				len = sprintf(&buf[0], " [%d]/%s [%d]/%s", (int)ti->arg1, pathname, (int)ti->arg3, pathname2);
+				break;
+			case FMT_RENAME:
+				len = sprintf(&buf[0], " %s  %s", pathname, pathname2);
 				break;
 			default:
 				len = sprintf(&buf[0], " %s ", pathname);
@@ -3123,6 +3198,25 @@ event_enter(int type, ktrace_event_t event)
 	int index;
 	bool found;
 
+/*	printf("============================\n");
+	printf("DUMPING ENTRY EVENT\n");
+	printf("timestamp: %llu\n", event->timestamp);
+	printf("arg1: %lu\n", event->arg1);
+	printf("arg2: %lu\n", event->arg2);
+	printf("arg3: %lu\n", event->arg3);
+	printf("arg4: %lu\n", event->arg4);
+	printf("threadid: %llu\n", event->threadid);
+	printf("debugid: %d\n", event->debugid);
+	printf("unk: %u\n", event->unk);
+	printf("walltime: %ld.%d\n", event->walltime.tv_sec, event->walltime.tv_usec);
+	index = BSC_INDEX(type);
+	if (index < MAX_BSD_SYSCALL && bsd_syscalls[index].sc_name)
+		printf("SYSCALL NAME ENTRY: %s\n", bsd_syscalls[index].sc_name);
+	else
+		printf("NOT A SYSCALL, type: 0x%0x\n", type);
+	printf("============================\n");*/
+
+
 	found = false;
 
 	switch (type) {
@@ -3163,12 +3257,25 @@ event_exit(char *sc_name, int type, ktrace_event_t event, int format)
 	if ((ti = event_find(event->threadid, type)) == NULL)
 		return;
 
-	pid = ktrace_get_pid_for_thread(s, event->threadid);
+/*	printf("============================\n");
+	printf("DUMPING EXIT EVENT\n");
+	printf("timestamp: %llu\n", event->timestamp);
+	printf("arg1: %lu\n", event->arg1);
+	printf("arg2: %lu\n", event->arg2);
+	printf("arg3: %lu\n", event->arg3);
+	printf("arg4: %lu\n", event->arg4);
+	printf("threadid: %llu\n", event->threadid);
+	printf("debugid: %d\n", event->debugid);
+	printf("unk: %u\n", event->unk);
+	printf("walltime: %ld.%d\n", event->walltime.tv_sec, event->walltime.tv_usec);
+	printf("============================\n");*/
 
+	pid = ktrace_get_pid_for_thread(s, event->threadid);
 	if (check_filter_mode(pid, ti, type, (int)event->arg1, (int)event->arg2, sc_name)) {
-		const char *pathname;
+		const char *pathname, *pathname2;
 
 		pathname = NULL;
+		pathname2 = NULL;
 
 		/* most things are just interested in the first lookup */
 		if (ti->pathname[0] != '\0')
@@ -3177,7 +3284,13 @@ event_exit(char *sc_name, int type, ktrace_event_t event, int format)
 		if (!pathname)
 			pathname = "";
 
-		format_print(ti, sc_name, event, type, format, event->timestamp, ti->stime, ti->waited, pathname, NULL);
+		if (ti->pathname2[0] != '\0')
+			pathname2 = ti->pathname2;
+
+		if (!pathname2)
+			pathname2 = "";
+
+		format_print(ti, sc_name, event, type, format, event->timestamp, ti->stime, ti->waited, pathname, pathname2, NULL);
 	}
 
 	event_delete(ti);
@@ -3834,7 +3947,7 @@ diskio_print(struct diskio *dio)
 	if (check_filter_mode(-1, NULL, type, 0, 0, buf)) {
 		const char *pathname = ktrace_get_path_for_vp(s, dio->vnodeid);
 		format_print(NULL, buf, NULL, type, format, dio->completed_time,
-				dio->issued_time, 1, pathname ? pathname : "", dio);
+				dio->issued_time, 1, pathname ? pathname : "", "", dio);
 	}
 }
 

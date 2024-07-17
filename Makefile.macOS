@@ -1,0 +1,20 @@
+PLATFORM=macosx
+ARCH=arm64
+#PLATFORM=iphoneos
+#ARCH=arm64e
+
+fs_usage:
+	#SDKROOT=$(PLATFORM) cc -I./private_headers/ -g -O0 -arch arm64e -F /System/Library/PrivateFrameworks -framework ktrace -lutil -o fs_usage_ng fs_usage.c
+	SDKROOT=$(PLATFORM) cc -v -g -O0 -arch $(ARCH) -F./private_tbd/ -framework ktrace -lutil -o fs_usage_ng fs_usage.c
+	#codesign --entitlements entitlements.plist -f -s - fs_usage_ng
+	codesign -f -s - fs_usage_ng
+
+clean:
+	rm fs_usage_ng
+
+
+.PHONY: install
+install: fs_usage cryptex-run
+	@$(log_install)
+	cp fs_usage_ng ${CRYPTEX_BIN_DIR}
+
