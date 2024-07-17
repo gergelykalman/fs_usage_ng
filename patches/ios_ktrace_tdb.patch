@@ -1,0 +1,23 @@
+--- graft/private_tbd/ktrace.framework/ktrace.tbd	2025-07-15 17:11:53.839064161 +0200
++++ graft/private_tbd/ktrace.framework/ktrace.tbd_original	2025-07-15 17:11:51.065976327 +0200
+@@ -1,8 +1,8 @@
+ --- !tapi-tbd
+ tbd-version:     4
+ targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst, 
+-                   arm64e-macos, arm64e-maccatalyst ]
+-install-name:    '/System/Library/PrivateFrameworks/ktrace.framework/Versions/A/ktrace'
++                   arm64e-macos, arm64e-maccatalyst, arm64e-ios, arm64-ios ]
++install-name:    '/System/Library/PrivateFrameworks/ktrace.framework/ktrace'
+ current-version: 649.120.3
+ swift-abi-version: 7
+ exports:
+@@ -12,7 +12,7 @@
+                        __ZTSN11flatbuffers15ToStringVisitorE, __ZTSN11flatbuffers16DefaultAllocatorE, 
+                        __ZTSN11flatbuffers16IterationVisitorE, __ZTSN11flatbuffers9AllocatorE ]
+   - targets:         [ x86_64-macos, x86_64-maccatalyst, arm64-macos, arm64-maccatalyst, 
+-                       arm64e-macos, arm64e-maccatalyst ]
++                       arm64e-macos, arm64e-maccatalyst, arm64e-ios, arm64-ios ]
+     symbols:         [ '_$s6ktrace0A11_list_plansys5Int32VSpySo7__sFILEVG_AGSo0a6_plan_B8_flags_tatF', 
+                        '_$s6ktrace0A15_list_providersys5Int32VSpySo7__sFILEVG_AGSo0a10_provider_B8_flags_tatF', 
+                        '_$s6ktrace0A16_session_provideys5Int32Vs13OpaquePointerV_SPys4Int8VGSDyS2SGSo16KTProviderLogger_pSo0a1_C8_flags_tatF',
+

@@ -1,0 +1,24 @@
+.PHONY: all sdk_graft clean install
+
+include ../../logging.mk
+include ../../build_env.mk
+
+all: fs_usage
+
+sdk_graft:
+	./create_sdk_graft.sh "IOS"
+
+fs_usage: sdk_graft
+	@$(log_build)
+	SDKROOT=iphoneos cc -v -g -O0 -arch arm64e -I./graft/headers/ -I./graft/ios_headers/ -F./graft/private_tbd/ -framework ktrace -lutil -o fs_usage_ng fs_usage.c
+	codesign -s - fs_usage_ng
+
+clean:
+	rm -f fs_usage_ng
+	rm -f ${CRYPTEX_BIN_DIR}/fs_usage_ng
+
+
+install: fs_usage
+	@$(log_install)
+	cp fs_usage_ng ${CRYPTEX_BIN_DIR}
+

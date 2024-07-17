@@ -1,0 +1,26 @@
+.PHONY: all sdk_graft clean install
+
+PLATFORM=macosx
+ARCH=arm64
+#PLATFORM=iphoneos
+#ARCH=arm64e
+
+all: fs_usage
+
+sdk_graft:
+	./create_sdk_graft.sh "MACOS"
+
+fs_usage: sdk_graft
+	#SDKROOT=$(PLATFORM) cc -I./private_headers/ -g -O0 -arch arm64e -F /System/Library/PrivateFrameworks -framework ktrace -lutil -o fs_usage_ng fs_usage.c
+	SDKROOT=$(PLATFORM) cc -v -g -O0 -arch $(ARCH) -F/System/Library/PrivateFrameworks -framework ktrace -lutil -o fs_usage_ng fs_usage.c
+	#codesign --entitlements entitlements.plist -f -s - fs_usage_ng
+	codesign -f -s - fs_usage_ng
+
+clean:
+	rm -f fs_usage_ng
+
+
+install: fs_usage cryptex-run
+	@$(log_install)
+	cp fs_usage_ng ${CRYPTEX_BIN_DIR}
+
