@@ -42,6 +42,9 @@
  * SDKROOT=macosx.internal cc -I`xcrun -sdk macosx.internal --show-sdk-path`/System/Library/Frameworks/System.framework/Versions/B/PrivateHeaders -arch x86_64 -Os -lktrace -lutil -o fs_usage fs_usage.c
  */
 
+// TODO: json output currently contains excessive whitespace as we'd have to
+//       change a large amount of printf()s to get rid of these
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
@@ -98,8 +101,8 @@
  * MAX_WIDE_MODE_COLS controls -w mode to get even wider data in path.
  */
 #define MAXCOLS 132
-//#define MAX_WIDE_MODE_COLS 264
-#define MAX_WIDE_MODE_COLS (2 * PATH_MAX + 64)
+#define MAX_WIDE_MODE_COLS 264
+#define OVERRIDDEN_MAX_WIDE_MODE_COLS (2 * PATH_MAX + 64)
 #define MAXWIDTH MAX_WIDE_MODE_COLS + 64
 
 typedef struct th_info {
@@ -524,7 +527,7 @@ bool include_waited_flag = false;
 bool front_end_of_path_flag = false;
 bool want_kernel_task = true;
 bool filter_non_root_pids = false;
-bool max_width = false;			// TODO: instead of this, print the output in json!
+bool output_to_json = false;
 dispatch_source_t stop_timer, sigquit_source, sigpipe_source, sighup_source, sigterm_source, sigwinch_source;
 uint64_t mach_time_of_first_event;
 uint64_t start_time_ns = 0;
@@ -766,7 +769,7 @@ exit_usage(void)
 	fprintf(stderr, "  -S    if -R is specified, selects a start point in microseconds\n");
 	fprintf(stderr, "  -E    if -R is specified, selects an end point in microseconds\n");
 	fprintf(stderr, "  -u    filter out non-root pids\n");
-	fprintf(stderr, "  -m    override max width to print filenames in full (output will be ugly)\n");
+	fprintf(stderr, "  -j    output as JSON to get full paths (json is ugly due to excessive whitespaces)\n");
 	fprintf(stderr, "  pid   selects process(s) to sample\n");
 	fprintf(stderr, "  cmd   selects process(s) matching command string to sample\n");
 	fprintf(stderr, "By default (no options) the following processes are excluded from the output:\n");
@@ -826,7 +829,7 @@ main(int argc, char *argv[])
 	(void)ktrace_ignore_process_filter_for_event(s, P_PgOut);
 	(void)ktrace_ignore_process_filter_for_event(s, P_PgIn);
 
-	while ((ch = getopt(argc, argv, "bewf:R:S:E:t:WFu")) != -1) {
+	while ((ch = getopt(argc, argv, "bewf:R:S:E:t:WFuj")) != -1) {
 		switch (ch) {
 			case 'e':
 				exclude_pids = true;
@@ -895,8 +898,9 @@ main(int argc, char *argv[])
 				filter_non_root_pids = true;
 				break;
 
-			case 'm':
-				max_width = true;
+			case 'j':
+				output_to_json = true;
+				columns = OVERRIDDEN_MAX_WIDE_MODE_COLS;
 				break;
 
 			default:
@@ -1844,9 +1848,14 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 		last_walltime_secs = now_walltime.tv_sec;
 	}
 
-	if (columns > MAXCOLS || wideflag) {
+	if (output_to_json || columns > MAXCOLS || wideflag) {
 		tlen = timestamp_len;
-		nopadding = 0;
+		if (output_to_json)
+		{
+			nopadding = 1;
+		} else {
+			nopadding = 0;
+		}
 
 		sprintf(&timestamp[tlen], ".%06d", now_walltime.tv_usec);
 		tlen += 7;
@@ -1856,7 +1865,12 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 		nopadding = 1;
 	}
 
-	clen = printf("%s  %-17.17s", timestamp, sc_name);
+	if (output_to_json)
+	{
+		clen = printf("{\"timestamp\": \"%s\", \"event\": \"%-.17s\", \"data\": \"", timestamp, sc_name);	
+	} else {
+		clen = printf("%s  %-17.17s", timestamp, sc_name);
+	}
 	//clen += printf("uid: %d", uid);
 
 	framework_name = NULL;
@@ -3007,7 +3021,9 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 		len = 0;
 	}
 
-	if (clen > len) {
+	if (output_to_json) {
+		pathname = buf;
+	} else if (clen > len) {
 		/*
 		 * Add null padding if column length
 		 * is wider than the pathname length.
@@ -3058,10 +3074,20 @@ format_print(th_info_t ti, char *sc_name, ktrace_event_t event,
 	else
 		p2 = "  ";
 
-	if (columns > MAXCOLS || wideflag)
-		printf("%s%s %3llu.%06llu%s %s.%" PRIu64 "\n", p1, pathname, secs, usecs, p2, command_name, threadid);
-	else
-		printf("%s%s %3llu.%06llu%s %-12.12s\n", p1, pathname, secs, usecs, p2, command_name);
+	if (output_to_json)
+	{
+		if (waited)
+			p2 = "W";
+		else
+			p2 = "";
+
+		printf("\", \"paths\": \"%s%s\", \"time\": %llu.%06llu, \"p2\": \"%s\", \"command_name\": \"%s.%" PRIu64 "\"}\n", p1, pathname, secs, usecs, p2, command_name, threadid);
+	} else {
+		if (columns > MAXCOLS || wideflag)
+			printf("%s%s %3llu.%06llu%s %s.%" PRIu64 "\n", p1, pathname, secs, usecs, p2, command_name, threadid);
+		else
+			printf("%s%s %3llu.%06llu%s %-12.12s\n", p1, pathname, secs, usecs, p2, command_name);
+	}
 
 	if (!RAW_flag)
 		fflush(stdout);
