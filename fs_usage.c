@@ -98,7 +98,8 @@
  * MAX_WIDE_MODE_COLS controls -w mode to get even wider data in path.
  */
 #define MAXCOLS 132
-#define MAX_WIDE_MODE_COLS 264
+//#define MAX_WIDE_MODE_COLS 264
+#define MAX_WIDE_MODE_COLS (2 * PATH_MAX + 64)
 #define MAXWIDTH MAX_WIDE_MODE_COLS + 64
 
 typedef struct th_info {
@@ -523,6 +524,7 @@ bool include_waited_flag = false;
 bool front_end_of_path_flag = false;
 bool want_kernel_task = true;
 bool filter_non_root_pids = false;
+bool max_width = false;			// TODO: instead of this, print the output in json!
 dispatch_source_t stop_timer, sigquit_source, sigpipe_source, sighup_source, sigterm_source, sigwinch_source;
 uint64_t mach_time_of_first_event;
 uint64_t start_time_ns = 0;
@@ -764,6 +766,7 @@ exit_usage(void)
 	fprintf(stderr, "  -S    if -R is specified, selects a start point in microseconds\n");
 	fprintf(stderr, "  -E    if -R is specified, selects an end point in microseconds\n");
 	fprintf(stderr, "  -u    filter out non-root pids\n");
+	fprintf(stderr, "  -m    override max width to print filenames in full (output will be ugly)\n");
 	fprintf(stderr, "  pid   selects process(s) to sample\n");
 	fprintf(stderr, "  cmd   selects process(s) matching command string to sample\n");
 	fprintf(stderr, "By default (no options) the following processes are excluded from the output:\n");
@@ -886,10 +889,14 @@ main(int argc, char *argv[])
 
 			case 'F':
 				front_end_of_path_flag = true;
-                break;
+				break;
 
-            case 'u':
+			case 'u':
 				filter_non_root_pids = true;
+				break;
+
+			case 'm':
+				max_width = true;
 				break;
 
 			default:
