@@ -8,7 +8,7 @@
 -install-name:    '/System/Library/PrivateFrameworks/ktrace.framework/Versions/A/ktrace'
 +                   arm64e-macos, arm64e-maccatalyst, arm64e-ios, arm64-ios ]
 +install-name:    '/System/Library/PrivateFrameworks/ktrace.framework/ktrace'
- current-version: 649.120.3
+ current-version: 676
  swift-abi-version: 7
  exports:
 @@ -12,7 +12,7 @@

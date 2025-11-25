@@ -3,8 +3,8 @@
 BASE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 MACOS_SDK_PATH=$(xcrun --show-sdk-path --sdk macosx)
-XNU_VER="xnu-11417.121.6"
-DYLD_VER="dyld-1285.19"
+XNU_VER="xnu-12377.1.9"
+DYLD_VER="dyld-1323.3"
 
 # TODO: get dyld_cache_format.h
 
@@ -27,9 +27,9 @@ mkdir -p "./graft/src/dyld"
 tar xzf "./graft/downloads/${DYLD_VER}.tar.gz" -C "./graft/src/dyld/" --strip-components=1 
 
 
-echo "[+] Extracting constants from xnu's fcntl.h"
+echo "[+] Extracting constants from xnu's fcntl_private.h"
 mkdir -p "./graft/headers/"
-cat "./graft/src/xnu/bsd/sys/fcntl.h" | grep -Eo "#define[ \t]*(F_OPENFROM|F_UNLINKFROM|F_CHECK_OPENEVT|F_MARKDEPENDENCY|F_SETSTATICCONTENT|F_MOVEDATAEXTENTS|F_GETDEFAULTPROTLEVEL|F_GETDEFAULTPROTLEVEL|F_MAKECOMPRESSED|F_SET_GREEDY_MODE|F_SETIOTYPE|F_RECYCLE|F_OFD_SETLK|F_OFD_SETLKW|F_OFD_GETLK|F_OFD_SETLKWTIMEOUT|F_OFD_GETLKPID|F_SETCONFINED|F_GETCONFINED|F_NOCACHE_EXT)[ \t]*[0-9]*" > "./graft/headers/xnu_constants.h"
+cat "./graft/src/xnu/bsd/sys/fcntl_private.h" | grep -Eo "#define[ \t]*(F_OPENFROM|F_UNLINKFROM|F_CHECK_OPENEVT|F_MARKDEPENDENCY|F_SETSTATICCONTENT|F_MOVEDATAEXTENTS|F_GETDEFAULTPROTLEVEL|F_GETDEFAULTPROTLEVEL|F_MAKECOMPRESSED|F_SET_GREEDY_MODE|F_SETIOTYPE|F_RECYCLE|F_OFD_SETLK|F_OFD_SETLKW|F_OFD_GETLK|F_OFD_SETLKWTIMEOUT|F_OFD_GETLKPID|F_SETCONFINED|F_GETCONFINED|F_NOCACHE_EXT)[ \t]*[0-9]*" > "./graft/headers/xnu_constants.h"
 
 echo "[+] Extracting dyld_cache_format.h from dyld"
 cp "./graft/src/dyld/include/mach-o/dyld_cache_format.h" "./graft/headers/dyld_cache_format.h"
